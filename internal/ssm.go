@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -47,6 +48,7 @@ type (
 		InstanceId    string
 		PublicDomain  string
 		PrivateDomain string
+		LaunchTime    string
 	}
 
 	User struct {
@@ -62,6 +64,27 @@ type (
 		Local  string
 	}
 )
+
+type field int
+
+const (
+	name field = iota
+	instanceId
+	launchTime
+)
+
+func (t Target) getField(field field) string {
+	switch field {
+	case name:
+		return t.Name
+	case instanceId:
+		return t.InstanceId
+	case launchTime:
+		return t.LaunchTime
+	}
+	log.Fatalf("Unexpected field %d", field)
+	panic("unreachable")
+}
 
 // AskUser asks you which selects a user.
 func AskUser() (*User, error) {
@@ -214,7 +237,6 @@ func FindInstances(ctx context.Context, cfg aws.Config) (map[string]*Target, err
 		table      = make(map[string]*Target)
 		outputFunc = func(table map[string]*Target, output *ec2.DescribeInstancesOutput) {
 			var instances []Target
-			var maxNameLen = 0
 			for _, rv := range output.Reservations {
 				for _, inst := range rv.Instances {
 					name := ""
@@ -224,21 +246,16 @@ func FindInstances(ctx context.Context, cfg aws.Config) (map[string]*Target, err
 							break
 						}
 					}
-					if len(name) > maxNameLen {
-						maxNameLen = len(name)
-					}
 					instances = append(instances, Target{
 						Name:          name,
 						InstanceId:    aws.ToString(inst.InstanceId),
 						PublicDomain:  aws.ToString(inst.PublicDnsName),
 						PrivateDomain: aws.ToString(inst.PrivateDnsName),
+						LaunchTime:    inst.LaunchTime.Format("2006-01-02T03:04"),
 					})
 				}
 			}
-			for _, target := range instances {
-				padding := strings.Repeat(" ", maxNameLen-len(target.Name))
-				table[fmt.Sprintf("%s%s %s", target.Name, padding, target.InstanceId)] = &target
-			}
+			alignTable(table, instances, []field{name, instanceId, launchTime})
 		}
 	)
 
@@ -269,6 +286,33 @@ func FindInstances(ctx context.Context, cfg aws.Config) (map[string]*Target, err
 	}
 
 	return table, nil
+}
+
+func alignTable(table map[string]*Target, targets []Target, fields []field) {
+	maxLen := make(map[field]int)
+
+	setLarger := func(label string, field field) {
+		if len(label) > maxLen[field] {
+			maxLen[field] = len(label)
+		}
+	}
+
+	for _, target := range targets {
+		for _, field := range fields {
+			setLarger(target.getField(field), field)
+		}
+	}
+
+	for _, target := range targets {
+		var out string
+		for i, field := range fields {
+			out += target.getField(field)
+			if i != len(fields)-1 {
+				out += strings.Repeat(" ", 2+maxLen[field]-len(target.getField(field)))
+			}
+		}
+		table[out] = &target
+	}
 }
 
 // FindInstanceIdsWithConnectedSSM asks you which selects instances.
