@@ -268,6 +268,11 @@ func init() {
 	// will be global for your application.
 	rootCmd.PersistentFlags().StringP("profile", "p", "", `[optional] if you are having multiple aws profiles, it is one of profiles (default is AWS_PROFILE environment variable or default)`)
 	rootCmd.PersistentFlags().StringP("region", "r", "", `[optional] it is region in AWS that would like to do something`)
+	rootCmd.PersistentFlags().StringSliceP(
+		"fields", "f",
+		[]string{"name", "launch-time", "id"},
+		fmt.Sprintf("[optional] The fields to display, can be separated by commas. Allowed fields: %s",
+			internal.FieldFlags()))
 
 	// set version flag
 	rootCmd.InitDefaultVersionFlag()
@@ -275,4 +280,5 @@ func init() {
 	// mapping viper
 	viper.BindPFlag("profile", rootCmd.PersistentFlags().Lookup("profile"))
 	viper.BindPFlag("region", rootCmd.PersistentFlags().Lookup("region"))
+	viper.BindPFlag("fields", rootCmd.PersistentFlags().Lookup("fields"))
 }

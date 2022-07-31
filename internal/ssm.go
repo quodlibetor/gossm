@@ -22,6 +22,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssm_types "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/fatih/color"
+	"github.com/spf13/viper"
 )
 
 const (
@@ -48,7 +49,10 @@ type (
 		InstanceId    string
 		PublicDomain  string
 		PrivateDomain string
-		LaunchTime    string
+		PublicIp      string
+		PrivateIp     string
+		LaunchTime    *time.Time
+		Tags          map[string]string
 	}
 
 	User struct {
@@ -63,24 +67,102 @@ type (
 		Remote string
 		Local  string
 	}
+
+	fieldTag int
+	Field struct {
+		// The kind of field that this is
+		tag fieldTag
+		// If a field takes a modifier (e.g. a tag name or atime format) this will be present
+		value *string
+	}
 )
 
-type field int
+// The full list of fields that are allowed
+func FieldFlags() string {
+	fields := []string{
+		"name",
+		"id",
+		"launch-time",
+		"launch-time:GoDateFmt",
+		"tag:TagName",
+		"private-ip",
+		"public-ip",
+		"private-dns",
+		"public-dns",
+	}
+	return strings.Join(fields, ",")
+}
+
+func newFieldFromFlag(val string) (*Field, error) {
+	switch {
+	case val == "name":
+		return &Field{tag: name, value: nil}, nil
+	case val == "id":
+		return &Field{tag: instanceId, value: nil}, nil
+	case val == "launch-time":
+		defaultVal := "2006-01-02T03:04"
+		return &Field{tag: launchTime, value: &defaultVal}, nil
+	case strings.HasPrefix(val, "launch-time:"):
+		formatPart := strings.SplitN(val, ":", 2)[1]
+		return &Field{tag: launchTime, value: &formatPart}, nil
+	case strings.HasPrefix(val, "tag:"):
+		tagName := strings.SplitN(val, ":", 2)[1]
+		return &Field{tag: tag, value: &tagName}, nil
+	case val == "private-ip":
+		return &Field{tag: privateIp}, nil
+	case val == "public-ip":
+		return &Field{tag: publicIp}, nil
+	case val == "private-dns":
+		return &Field{tag: privateDomain}, nil
+	case val == "public-dns":
+		return &Field{tag: publicDomain}, nil
+	default:
+		return nil, fmt.Errorf("Unsupported field: %s", val)
+	}
+}
 
 const (
-	name field = iota
+	name fieldTag = iota
 	instanceId
 	launchTime
+	// An AWS instance tag
+	tag
+	privateDomain
+	publicDomain
+	privateIp
+	publicIp
 )
 
-func (t Target) getField(field field) string {
-	switch field {
+func (t Target) getFieldForDisplay(field Field) string {
+	valOrTilde := func(val string) string {
+		if val != "" {
+			return val
+		} else {
+			return "~"
+		}
+	}
+
+	switch field.tag {
 	case name:
 		return t.Name
 	case instanceId:
 		return t.InstanceId
 	case launchTime:
-		return t.LaunchTime
+		return t.LaunchTime.Format(*field.value)
+	case tag:
+		val, exists := t.Tags[*field.value]
+		if !exists {
+			val = "~"
+		}
+		return val
+	case publicDomain:
+		return valOrTilde(t.PublicDomain)
+	case privateDomain:
+		return valOrTilde(t.PrivateDomain)
+	case publicIp:
+		return valOrTilde(t.PublicIp)
+	case privateIp:
+		return valOrTilde(t.PrivateIp)
 	}
 	log.Fatalf("Unexpected field %d", field)
 	panic("unreachable")
@@ -232,6 +314,20 @@ func AskPorts() (port *Port, retErr error) {
 
 // FindInstances returns all of instances-map with running state.
 func FindInstances(ctx context.Context, cfg aws.Config) (map[string]*Target, error) {
+	var fields []*Field
+	rawFields := viper.GetStringSlice("fields")
+	if len(rawFields) == 0 {
+		return nil, fmt.Errorf("[programming error] get list of fields to display")
+	}
+	for _, rawField := range rawFields {
+		field, err := newFieldFromFlag(rawField)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, field)
+	}
+	//}
+
 	var (
 		client     = ec2.NewFromConfig(cfg)
 		table      = make(map[string]*Target)
@@ -240,10 +336,12 @@ func FindInstances(ctx context.Context, cfg aws.Config) (map[string]*Target, err
 			for _, rv := range output.Reservations {
 				for _, inst := range rv.Instances {
 					name := ""
+					tags := make(map[string]string)
 					for _, tag := range inst.Tags {
-						if aws.ToString(tag.Key) == "Name" {
-							name = aws.ToString(tag.Value)
-							break
+						key, val := aws.ToString(tag.Key), aws.ToString(tag.Value)
+						tags[key] = val
+						if key == "Name" {
+							name = val
 						}
 					}
 					instances = append(instances, Target{
@@ -251,11 +349,14 @@ func FindInstances(ctx context.Context, cfg aws.Config) (map[string]*Target, err
 						InstanceId:    aws.ToString(inst.InstanceId),
 						PublicDomain:  aws.ToString(inst.PublicDnsName),
 						PrivateDomain: aws.ToString(inst.PrivateDnsName),
-						LaunchTime:    inst.LaunchTime.Format("2006-01-02T03:04"),
+						PublicIp:      aws.ToString(inst.PublicIpAddress),
+						PrivateIp:     aws.ToString(inst.PrivateIpAddress),
+						LaunchTime:    inst.LaunchTime,
+						Tags:          tags,
 					})
 				}
 			}
-			alignTable(table, instances, []field{name, instanceId, launchTime})
+			alignTable(table, instances, fields)
 		}
 	)
 
@@ -288,30 +389,29 @@ func FindInstances(ctx context.Context, cfg aws.Config) (map[string]*Target, err
 	return table, nil
 }
 
-func alignTable(table map[string]*Target, targets []Target, fields []field) {
-	maxLen := make(map[field]int)
-
-	setLarger := func(label string, field field) {
-		if len(label) > maxLen[field] {
-			maxLen[field] = len(label)
-		}
-	}
+func alignTable(table map[string]*Target, targets []Target, fields []*Field) {
+	maxLen := make(map[Field]int)
 
 	for _, target := range targets {
 		for _, field := range fields {
-			setLarger(target.getField(field), field)
+			fieldVal := target.getFieldForDisplay(*field)
+			if len(fieldVal) > maxLen[*field] {
+				maxLen[*field] = len(fieldVal)
+			}
 		}
 	}
 
 	for _, target := range targets {
 		var out string
 		for i, field := range fields {
-			out += target.getField(field)
+			fieldVal := target.getFieldForDisplay(*field)
+			out += fieldVal
 			if i != len(fields)-1 {
-				out += strings.Repeat(" ", 2+maxLen[field]-len(target.getField(field)))
+				out += strings.Repeat(" ", 2+maxLen[*field]-len(fieldVal))
 			}
 		}
-		table[out] = &target
+		t := target // don't create a reference to the loop variable, which doesn't get recreated
+		table[out] = &t
 	}
 }
 
